@@ -65,6 +65,9 @@
 
   /* 로그인 */
   .login-wrap{min-height:70vh;display:flex;align-items:center;justify-content:center;}
+  .spinner{width:28px;height:28px;margin:0 auto 14px;border:3px solid var(--rule);
+    border-top-color:var(--brass);border-radius:50%;animation:spin .8s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
   .card{max-width:400px;width:100%;padding:30px;background:#fff;
     border:1px solid var(--rule);}
   .card h2{font-family:'Noto Serif KR',serif;font-size:21px;margin:0 0 4px;}
@@ -154,7 +157,16 @@
 </div>
 
 <main>
-  <section class="panel active" id="p-login">
+  <section class="panel active" id="p-loading">
+    <div class="login-wrap">
+      <div style="text-align:center;color:var(--ink-soft);font-size:14.5px;">
+        <div class="spinner"></div>
+        불러오는 중…
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-login">
     <div class="login-wrap">
       <div class="card">
         <h2>로그인</h2>
@@ -198,7 +210,7 @@
 
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
-import { getFirestore, doc, getDoc, setDoc, collection, getDocs }
+import { getFirestore, doc, getDoc, setDoc, addDoc, collection, getDocs }
   from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
 import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged }
   from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
@@ -239,6 +251,17 @@ const store = {
     mem[k] = v;
   }
 };
+async function logVisit(u){
+  if(!FB) return;
+  const ts = Date.now();
+  try{
+    await addDoc(collection(db,"visitLog"),
+      {sid:u.id, role:u.role, grade:u.grade||null, cls:u.cls||null, ts});
+    if(u.role==="student"){
+      await setDoc(doc(db,"students",u.id), {lastLogin: ts}, {merge:true});
+    }
+  }catch(e){ /* 통계 실패는 무시 - 로그인 자체엔 영향 없음 */ }
+}
 async function loadChoices(){
   if(!FB){
     try{ const v = localStorage.getItem(LS+"choices"); return v?JSON.parse(v):{}; }catch(e){ return mem.choices||{}; }
@@ -249,7 +272,7 @@ async function loadChoices(){
 }
 async function saveChoices(sid, ch){
   CHOICES[sid] = ch;
-  if(FB){ await setDoc(doc(db,"students",sid), {choices: ch}); return; }
+  if(FB){ await setDoc(doc(db,"students",sid), {choices: ch}, {merge:true}); return; }
   try{ localStorage.setItem(LS+"choices", JSON.stringify(CHOICES)); }
   catch(e){ mem.choices = CHOICES; }
 }
@@ -389,8 +412,7 @@ function buildTabs(){
   });
   show(TABS[USER.role][0][0]);
 }
-function logout(){
-  if(FB){ try{ signOut(auth); }catch(e){} }
+function showLoginScreen(){
   USER = null;
   document.getElementById("who").innerHTML = "";
   document.getElementById("tabs").innerHTML = "";
@@ -399,6 +421,10 @@ function logout(){
   document.getElementById("loginStatus").textContent = "";
   document.querySelectorAll(".panel").forEach(p=>p.classList.remove("active"));
   document.getElementById("p-login").classList.add("active");
+}
+function logout(){
+  if(FB){ try{ signOut(auth); }catch(e){} }
+  showLoginScreen();
 }
 document.getElementById("loginBtn").onclick = doLogin;
 document.getElementById("lpw").addEventListener("keydown",e=>{ if(e.key==="Enter") doLogin(); });
@@ -465,6 +491,7 @@ function applyUser(user){
     w.innerHTML = `<strong>${esc(USER.name)} 선생님</strong><br>${HOMEROOM[USER.name]?HOMEROOM[USER.name]+" 담임":"교과 담당"}`;
   else w.innerHTML = `<strong>관리자</strong><br>교무부`;
   buildTabs();
+  logVisit(USER);
 }
 
 function userFromEmail(email){
@@ -484,9 +511,9 @@ function userFromEmail(email){
 
 if(FB){
   onAuthStateChanged(auth, async (fbUser)=>{
-    if(!fbUser){ return; }
+    if(!fbUser){ showLoginScreen(); return; }
     const u = userFromEmail(fbUser.email || "");
-    if(!u) return;
+    if(!u){ showLoginScreen(); return; }
     CHOICES = await loadChoices();
     PATCH = (await store.get("patch")) || {};
     const hr = await store.get("homeroom");
@@ -700,9 +727,10 @@ function drawAdmin(){
       <button data-v="block" class="${aTab==="block"?"active":""}">선택과목 묶음</button>
       <button data-v="hr" class="${aTab==="hr"?"active":""}">담임 지정</button>
       <button data-v="io" class="${aTab==="io"?"active":""}">데이터 백업</button>
+      <button data-v="visits" class="${aTab==="visits"?"active":""}">접속 현황</button>
     </div><div id="aBody"></div>`;
   el.querySelectorAll("#aTabs button").forEach(b=>b.onclick=()=>{ aTab=b.dataset.v; drawAdmin(); });
-  ({common:adminCommon, block:adminBlock, hr:adminHR, io:adminIO})[aTab]();
+  ({common:adminCommon, block:adminBlock, hr:adminHR, io:adminIO, visits:adminVisits})[aTab]();
 }
 
 function adminCommon(){
@@ -862,6 +890,77 @@ function adminIO(){
   };
 }
 
+async function adminVisits(){
+  const box = document.getElementById("aBody");
+  if(!FB){
+    box.innerHTML = `<div class="empty">Firebase 연결 전에는 접속 기록이 남지 않습니다.</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="empty">불러오는 중…</div>`;
+
+  const [studentDocs, logDocs] = await Promise.all([
+    getDocs(collection(db,"students")),
+    getDocs(collection(db,"visitLog"))
+  ]);
+  const everLogged = new Set();
+  studentDocs.forEach(d=>{ if(d.data().lastLogin) everLogged.add(d.id); });
+
+  const logs = [];
+  logDocs.forEach(d=>logs.push(d.data()));
+  logs.sort((a,b)=> (b.ts||0) - (a.ts||0));
+
+  const startOfToday = new Date(); startOfToday.setHours(0,0,0,0);
+  const todayCount = logs.filter(l=>l.ts >= startOfToday.getTime()).length;
+  const todayUnique = new Set(logs.filter(l=>l.ts >= startOfToday.getTime()).map(l=>l.sid)).size;
+
+  const byGrade = {1:{total:0,seen:0},2:{total:0,seen:0},3:{total:0,seen:0}};
+  Object.entries(DATA.students).forEach(([sid,s])=>{
+    byGrade[s.grade].total++;
+    if(everLogged.has(sid)) byGrade[s.grade].seen++;
+  });
+
+  const neverList = Object.entries(DATA.students)
+    .filter(([sid])=>!everLogged.has(sid))
+    .map(([sid,s])=>({sid, grade:s.grade, cls:s.cls}))
+    .sort((a,b)=> a.sid.localeCompare(b.sid));
+
+  const gradeRows = [1,2,3].map(g=>{
+    const {total,seen} = byGrade[g];
+    const pct = total ? Math.round(seen/total*100) : 0;
+    return `<tr><td style="text-align:left;padding:6px 4px;">${g}학년</td>
+      <td style="text-align:right;padding:6px 4px;">${seen} / ${total}명</td>
+      <td style="text-align:right;padding:6px 4px;color:var(--ink-soft);">${pct}%</td></tr>`;
+  }).join("");
+
+  const recentRows = logs.slice(0,30).map(l=>{
+    const d = new Date(l.ts);
+    const label = l.role==="student" ? `학번 ${l.sid}`
+                : l.role==="teacher" ? `${l.sid} 선생님`
+                : "관리자";
+    return `<tr><td style="padding:5px 4px;">${label}</td>
+      <td style="padding:5px 4px;color:var(--ink-soft);">${d.toLocaleString("ko-KR",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}</td></tr>`;
+  }).join("");
+
+  const neverHTML = neverList.length
+    ? `<div class="list">${neverList.map(n=>`<button disabled style="cursor:default;">${n.grade}-${n.cls} ${n.sid.slice(3)}번</button>`).join("")}</div>`
+    : `<div class="empty">전원 로그인 기록이 있습니다.</div>`;
+
+  box.innerHTML = `
+    <h3 class="sub" style="margin-top:0;">오늘 접속</h3>
+    <p style="font-size:26px;font-weight:700;margin:0 0 4px;">${todayUnique}<span style="font-size:14px;font-weight:400;color:var(--ink-soft);"> 명 (총 ${todayCount}회)</span></p>
+
+    <h3 class="sub">학년별 로그인 이력(누적)</h3>
+    <table class="tt" style="max-width:420px;"><tbody>${gradeRows}</tbody></table>
+
+    <h3 class="sub">한 번도 로그인 안 한 학생 (${neverList.length}명)</h3>
+    ${neverHTML}
+
+    <h3 class="sub">최근 접속 30건</h3>
+    <table class="tt"><tbody>${recentRows || '<tr><td class="empty">기록 없음</td></tr>'}</tbody></table>
+    <p class="hint" style="margin-top:14px;">접속 기록은 로그인할 때마다 하나씩 쌓입니다. 학기 말에 너무 많아지면 Firestore 콘솔에서 visitLog 컬렉션을 통째로 비워도 학생 데이터에는 영향 없습니다.</p>
+  `;
+}
+
 /* ---------- 시작 ---------- */
 (async ()=>{
   if(!FB){
@@ -869,6 +968,7 @@ function adminIO(){
     PATCH   = (await store.get("patch"))   || {};
     const hr = await store.get("homeroom");
     HOMEROOM = (hr == null) ? {...DEFAULT_HOMEROOM} : hr;
+    showLoginScreen();
   }
   const note = document.getElementById("modeNote");
   note.innerHTML = FB
